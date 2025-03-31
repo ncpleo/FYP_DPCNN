@@ -12,7 +12,7 @@ import os
 import json
 from collections import defaultdict
 import matplotlib.pyplot as plt
-import torch.nn.functional as F  # Import functional as F
+import torch.nn.functional as F
 import re
 import time
 from tqdm import tqdm
@@ -20,482 +20,620 @@ import random
 from collections import Counter
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, precision_recall_curve
+import seaborn as sns
 from torch.utils.data import WeightedRandomSampler
 
+# Set a random seed for PyTorch to make results reproducible (same random numbers each time we run the code).
 torch.manual_seed(1)
+
+# Create a parser to handle command-line arguments, so we can customize settings like learning rate when running the script.
 parser = argparse.ArgumentParser()
-parser.add_argument('--lr', type=float, default=0.001)
-parser.add_argument('--batch_size', type=int, default=256)
-parser.add_argument('--epoch', type=int, default=20)
-parser.add_argument('--gpu', type=int, default=0)
-#parser.add_argument('--out_channel', type=int, default=2)
-parser.add_argument('--label_num', type=int, default=2)
-parser.add_argument('--seed', type=int, default=1)
+
+# Add arguments for hyperparameters that we can set when running the script (e.g., python main.py --lr 0.01).
+parser.add_argument('--lr', type=float, default=0.001)  # Learning rate: how big a step the model takes when updating weights.
+parser.add_argument('--batch_size', type=int, default=256)  # Batch size: number of samples processed before updating weights.
+parser.add_argument('--epoch', type=int, default=20)  # Number of epochs: how many times the model sees the entire dataset.
+parser.add_argument('--gpu', type=int, default=0)  # GPU ID to use (0 for first GPU); not used directly in this script.
+parser.add_argument('--label_num', type=int, default=2)  # Number of classes (2 for binary classification: positive/negative).
+parser.add_argument('--seed', type=int, default=1)  # Random seed for reproducibility.
 args = parser.parse_args()
 
-# Create the configuration
+# Create a Config object to store our settings, using the values from the command-line arguments.
 config = Config(batch_size=args.batch_size,
                 label_num=args.label_num,
                 learning_rate=args.lr,
                 epoch=args.epoch)
 
-#Training part
-def train_model(config):
-    start_time = time.time()  # Start timer
-    
-    torch.manual_seed(0)
+# Define paths to our data folders, where the preprocessed training, validation, test, and raw data are stored.
+train_data_path = 'data/train_split'  # Folder with training data.
+val_data_path = 'data/val_split'  # Folder with validation data.
+test_data_path = 'data/test_split'  # Folder with test data.
+raw_data_path = 'data/raw'  # Folder with raw (unprocessed) data.
 
-   # Check if CUDA is available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"{'GPU is available.' if torch.cuda.is_available() else 'Using CPU.'}")
+# Define folders to save model checkpoints (best model weights) and graphs (like loss curves).
+checkpoint_dir = 'checkpoints'  # Folder to save the best model.
+graph_dir = os.path.join('pictures', 'graphs')  # Folder to save plots and graphs.
+os.makedirs(checkpoint_dir, exist_ok=True)  # Create the checkpoint folder if it doesn't exist.
+os.makedirs(graph_dir, exist_ok=True)  # Create the graphs folder if it doesn't exist.
 
-    # Path to data
-    train_data_path = 'data/train_split'
-    val_data_path = 'data/val_split'
-    test_data_path = 'data/test_split'
-    raw_data_path = 'data/raw'
-    
-    # Create directories for checkpoints and graphs
-    checkpoint_dir = 'checkpoints'
-    graph_dir = os.path.join('pictures', 'graphs')
+# Create a folder to store the word-to-index mapping (a dictionary that assigns numbers to words).
+mapping_dir = 'mappings'
+os.makedirs(mapping_dir, exist_ok=True)
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    os.makedirs(graph_dir, exist_ok=True)
-    
-    # Initialize a list to store loss values
-    loss_values = []
-    
-    # Create a directory for storing the mapping if it doesn't exist
-    mapping_dir = 'mappings'
-    os.makedirs(mapping_dir, exist_ok=True)
-    
-    # Save the word_to_index mapping to a JSON file in the mappings directory
+# Path to the GloVe pre-trained word embeddings file, which provides vector representations for words.
+embedding_path = 'data/glove/glove.6B.300d.txt'
+
+# Check if a GPU is available for faster training; if not, use the CPU.
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"{'GPU is available.' if torch.cuda.is_available() else 'Using CPU.'}")
+
+
+def train_model(config, train_data_path, val_data_path, test_data_path, device, checkpoint_dir, graph_dir):
+    """
+    Train the DPCNN model, evaluate it, and create plots to visualize the results.
+
+    Args:
+        config: A Config object with settings like batch size and learning rate.
+        train_data_path (str): Path to the training data folder.
+        val_data_path (str): Path to the validation data folder.
+        test_data_path (str): Path to the test data folder.
+        device: The device (CPU or GPU) to run the model on.
+        checkpoint_dir (str): Folder to save the best model weights.
+        graph_dir (str): Folder to save the plots and graphs.
+    """
+    # Load or create a word-to-index mapping, which assigns a unique number to each word in our dataset.
     mapping_file_path = os.path.join(mapping_dir, 'word_to_index.json')
-    word_to_index = load_word_to_index(mapping_file_path)
-    
-    # Process your new data to create a new list of words
-    new_words = create_word_to_index(raw_data_path).keys()
-    word_to_index = update_word_to_index(new_words, word_to_index)
-    
-    # Save the updated word_to_index mapping back to the JSON file
+    word_to_index = load_word_to_index(mapping_file_path)  # Load existing mapping if it exists.
+    new_words = create_word_to_index(raw_data_path).keys()  # Get all words from the raw data.
+    word_to_index = update_word_to_index(new_words, word_to_index)  # Add any new words to the mapping.
     with open(mapping_file_path, 'w', encoding='utf-8') as f:
-        json.dump(word_to_index, f)
+        json.dump(word_to_index, f)  # Save the updated mapping to a JSON file.
     
-    # Initialize the dataset with the word-to-index mapping
-    training_set = TextDataset(path=train_data_path, word_to_index=word_to_index, augment=True)
+    # Load the datasets for training, validation, and testing using our TextDataset class.
+    training_set = TextDataset(path=train_data_path, word_to_index=word_to_index, augment=True)  # Training data with augmentation.
+    validation_set = TextDataset(path=val_data_path, word_to_index=word_to_index, augment=False)  # Validation data, no augmentation.
+    testing_set = TextDataset(path=test_data_path, word_to_index=word_to_index, augment=False)  # Test data, no augmentation.
     
+    # Count how many samples belong to each class (e.g., positive, negative) in the training set.
     label_counts = Counter(training_set.labels)
-    total_samples = sum(label_counts.values())
+    total_samples = sum(label_counts.values())  # Total number of training samples.
+    
+    # Calculate class weights to handle class imbalance (give more importance to underrepresented classes).
     class_weights = torch.tensor([total_samples / label_counts[i] for i in range(len(label_counts))]).to(device)
     
-        
-    validation_set = TextDataset(path=val_data_path, word_to_index=word_to_index, augment=False)  # Load validation set
-
-    # Compute sample weights
+    # Create sample weights for balanced sampling, so the model sees underrepresented classes more often.
     sample_weights = [1 / label_counts[label] for label in training_set.labels]
-
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(training_set), replacement=True)
     
-    training_iter = data.DataLoader(dataset=training_set,
-                                    batch_size=config.batch_size,
-                                    num_workers=16,
-                                    sampler=sampler)
-
-    validation_iter = data.DataLoader(dataset=validation_set,
-                                      batch_size=config.batch_size,
-                                      num_workers=16)
-
-    
-    # Path to your GloVe file
-    embedding_path = 'data/glove/glove.6B.300d.txt'
-
-    # Load pre-trained embeddings
-    embedding_matrix = load_pretrained_embeddings(embedding_path, word_to_index, config.word_embedding_dimension)
-
-    # Initialize embedding layer with pre-trained weights
-    embeds = nn.Embedding.from_pretrained(embedding_matrix, freeze=False).to(device)  # Set freeze=True if you don't want to fine-tune
-
-    # Normalize embedding weights
-    #embeds.weight.data = F.normalize(embeds.weight.data, p=2, dim=1)
-    
-    
-    model = DPCNN(config).to(device)
-    
-    
-    #criterion = nn.CrossEntropyLoss()
-    #L2
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-3)
-    #scheduler for learning rate
-    #decrease
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-    #increase
-    #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, total_steps=len(training_iter) * config.epoch)
-    
-    #criterion = nn.CrossEntropyLoss()
+    # Define the loss function (CrossEntropyLoss) with class weights to handle imbalance.
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     
-    count = 0
-    loss_sum = 0
-    best_val_loss = float('inf')  # For early stopping
-    patience = 5  # Number of epochs to wait for improvement
-    trigger_times = 0
-    # Accumulate gradients over multiple steps
-    accumulation_steps = 4
+    # Create the DPCNN model and move it to the chosen device (CPU or GPU).
+    model = DPCNN(config).to(device)
+    
+    # Load the pre-trained GloVe embeddings and create an embedding matrix for our vocabulary.
+    embedding_matrix = load_pretrained_embeddings(embedding_path, word_to_index, config.word_embedding_dimension)
+
+    # Create an embedding layer with the pre-trained weights, allowing fine-tuning (freeze=False).
+    embeds = nn.Embedding.from_pretrained(embedding_matrix, freeze=False).to(device)
+
+    # Set up the optimizer (AdamW) to update the model's weights, with a small weight decay for regularization.
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-2)
+    
+    # Add a learning rate scheduler to reduce the learning rate if validation loss plateaus.
+    #scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+    
+    # Use a gradient scaler for mixed precision training, which can speed up training on GPUs.
     scaler = torch.amp.GradScaler()
     
-    # Train the model
+    # Create data loaders to handle batching and shuffling of the datasets.
+    training_iter = data.DataLoader(dataset=training_set, batch_size=config.batch_size, num_workers=16, sampler=sampler)
+    validation_iter = data.DataLoader(dataset=validation_set, batch_size=config.batch_size, num_workers=16)
+    testing_iter = data.DataLoader(dataset=testing_set, batch_size=config.batch_size, num_workers=16)
+    
+    # Create lists to store the loss and accuracy for each epoch, so we can plot them later.
+    train_losses = []  # Training loss per epoch.
+    val_losses = []  # Validation loss per epoch.
+    train_accuracies = []  # Training accuracy per epoch.
+    val_accuracies = []  # Validation accuracy per epoch.
+    best_val_loss = float('inf')  # Keep track of the best validation loss to save the best model.
+    patience = 10  # Number of epochs to wait for improvement before early stopping.
+    patience_counter = 0  # Counter for early stopping.    
+    
+    # Start the training loop, where the model learns over multiple epochs.
     for epoch in range(config.epoch):
-        model.train()  # Set model to training mode
-        optimizer.zero_grad()
-        for step, (batch_data, batch_label) in enumerate(training_iter):
-            batch_data = batch_data.to(device)
-            batch_label = batch_label.to(device)
-            #print(f"Batch data shape: {batch_data.shape}")
+        model.train()  # Set the model to training mode (enables dropout, batch norm updates, etc.).
+        epoch_loss = 0.0  # Total loss for this epoch.
+        num_batches = 0  # Number of batches processed.
+        correct_train = 0  # Number of correct predictions in training.
+        total_train = 0  # Total number of training samples.
+        
+        # Check if gradient accumulation is set in config; if not, default to 1 (no accumulation).
+        accumulation_steps = config.accumulation_steps if hasattr(config, 'accumulation_steps') else 1
+        
+        # Loop through each batch of training data.
+        for batch_data, batch_label in training_iter:
+            # Move the batch data and labels to the chosen device (CPU or GPU).
+            batch_data, batch_label = batch_data.to(device), batch_label.to(device)
+            optimizer.zero_grad()  # Clear any previous gradients.
             
-            with torch.amp.autocast(device_type="cuda"):  # Mixed precision training
-                # Embed input data using pre-trained embeddings
+            # Use mixed precision to speed up training and reduce memory usage.
+            with torch.amp.autocast(device_type="cuda"):
+                # Convert word indices to embeddings, reshape for the DPCNN model, and get predictions.
                 input_data = embeds(batch_data).float().permute(0, 2, 1).unsqueeze(1)
+                out = model(input_data)  # Forward pass: get model predictions.
                 
-
-
-                # Forward pass through the model
-                out = model(input_data)
-                
-                # Calculate loss
-                loss = criterion(out, batch_label) / accumulation_steps  # Scale loss
-                
-                loss_sum += loss.item()
-                count += 1
-
-                if count % 100 == 0:
-                    avg_loss = loss_sum / 100
-                    
-                    print(f"epoch {epoch}, The loss is: {avg_loss:.5f}")
-                    loss_values.append(avg_loss)
-                    loss_sum = 0
-                    count = 0
+                # Calculate the loss (how far predictions are from true labels).
+                loss = criterion(out, batch_label) / accumulation_steps
+            # Backpropagate the loss to compute gradients.
             scaler.scale(loss).backward()
             
-            if (step + 1) % accumulation_steps == 0:  # Update weights every few steps
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                
-                # Normalize embeddings dynamically after optimizer step
-                with torch.no_grad():
-                    embeds.weight.data = F.normalize(embeds.weight.data, p=2, dim=1)
-                    
-        # Save the model in every epoch
-        model.save(os.path.join(checkpoint_dir, f'epoch{epoch}.ckpt'))
-
-        # Validation step
-        val_loss, val_accuracy = validate_model(validation_iter, model, criterion, device, embeds)
-        print(f"Epoch {epoch}, Validation Loss: {val_loss:.5f}, Validation Accuracy: {val_accuracy:.2f}%")
-        # Step the scheduler
-        scheduler.step(val_loss)
-        # Optionally, print current learning rate
-        for param_group in optimizer.param_groups:
-            print("Learning rate:", param_group['lr'])
+            # Add the loss for this batch to the epoch total (adjust for accumulation).
+            epoch_loss += loss.item() * accumulation_steps
+            num_batches += 1
             
-        # Early stopping
+            # Calculate training accuracy for this batch.
+            _, predicted = torch.max(out, 1)  # Get the predicted class (highest score).
+            total_train += batch_label.size(0)  # Add the number of samples in this batch.
+            correct_train += (predicted == batch_label).sum().item()  # Count correct predictions.
+            
+            # Update the model weights using the optimizer.
+            scaler.step(optimizer)
+            scaler.update()
+        
+        # Calculate the average training loss and accuracy for this epoch.
+        avg_train_loss = epoch_loss / num_batches
+        train_accuracy = 100 * correct_train / total_train
+        train_losses.append(avg_train_loss)
+        train_accuracies.append(train_accuracy)
+        print(f"Epoch {epoch+1}/{config.epoch}, Training Loss: {avg_train_loss:.5f}, Training Accuracy: {train_accuracy:.2f}%")
+        
+        # Evaluate the model on the validation set.
+        val_loss, val_accuracy, _, _, val_cm = evaluate_model(validation_iter, model, criterion, device, embeds)
+        val_losses.append(val_loss)
+        val_accuracies.append(val_accuracy)
+        print(f"Validation Loss: {val_loss:.5f}, Validation Accuracy: {val_accuracy:.2f}%")
+        
+        # Update the learning rate scheduler based on validation loss.
+        #scheduler.step(val_loss)
+        
+        # Save the model if it has the best validation loss so far.
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            trigger_times = 0
-            # Save the best model
-            torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'best_model.ckpt'))
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best_model.ckpt'))
+            patience_counter = 0  # Reset the patience counter.
+            print(f"Best model saved with validation loss: {best_val_loss:.5f}")
         else:
-            trigger_times += 1
-            if trigger_times >= patience:
-                print("Early stopping!")
-                break
-
-        loss_sum = 0
-        count = 0
+            patience_counter += 1
+            print(f"No improvement in validation loss. Patience counter: {patience_counter}/{patience}")
         
-    end_time = time.time()  # End timer
-    elapsed_time = end_time - start_time
-    print(f"Training completed in {elapsed_time:.2f} seconds.")
+        # Early stopping: stop training if validation loss doesn't improve for 'patience' epochs.
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs.")
+            break
     
-    plot_loss_graph(loss_values, graph_dir, filename='trainging_loss_graph.png')
+    # Load the best model (based on validation loss) and evaluate it on the test set.
+    model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'best_model.ckpt'), weights_only=True))
     
-    #test
-    checkpoint_path = f'checkpoints/best_model.ckpt'  # Update this path if needed
-    test_model(checkpoint_path, config, device, embeds, subset_size=1000)
+    # Get test metrics, including probabilities for ROC and precision-recall curves.
+    test_loss, test_accuracy, test_preds, test_labels, test_cm, test_probs = evaluate_model(testing_iter, model, criterion, device, embeds, return_probs=True)
+    print(f"Test Loss: {test_loss:.5f}, Test Accuracy: {test_accuracy:.2f}%")
     
-
-#Testing part
-def test_model(checkpoint_path, config, device, embeds, subset_size=1000):
-    print("Starting test model...")
-    start_time = time.time()  # Start timer
+    # Print a detailed report with precision, recall, and F1-score for each class.
+    print("Classification Report:\n", classification_report(test_labels, test_preds))
     
-    # Load the model from checkpoint
-    model = DPCNN(config).to(device)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))  # Load model parameters
-    model.eval()
+    # Show the distribution of predicted and actual labels in the test set.
+    pred_counter = Counter(test_preds)  # Count predicted labels.
+    label_counter = Counter(test_labels)  # Count actual labels.
+    print("\nPredicted Distribution:")
+    print(f"Negatives (0): {pred_counter[0]}")
+    print(f"Positives (1): {pred_counter[1]}")
+    print("\nActual Distribution:")
+    print(f"Negatives (0): {label_counter[0]}")
+    print(f"Positives (1): {label_counter[1]}")
     
-    print("Model loaded. Preparing test dataset...")
-    test_data_path = 'data/train_split'
+    # Create a dictionary of hyperparameters to display on the plots.
+    hyperparams = {
+        'Learning Rate': args.lr,
+        'Batch Size': args.batch_size,
+        'Epochs': args.epoch
+    }
     
-    # Load the word_to_index mapping from the mappings directory
-    mapping_file_path = os.path.join('mappings', 'word_to_index.json')
-    with open(mapping_file_path, 'r', encoding='utf-8') as f:
-        word_to_index = json.load(f)
-
-    full_testing_set  = TextDataset(path=test_data_path, word_to_index=word_to_index, augment=False)
-
-    # Randomly sample a subset
-    if len(full_testing_set) > subset_size:
-        indices = random.sample(range(len(full_testing_set)), subset_size)
-        subset = torch.utils.data.Subset(full_testing_set, indices)
-    else:
-        subset = full_testing_set
-
-    testing_iter = data.DataLoader(dataset=subset,
-                                    batch_size=config.batch_size,
-                                    num_workers=16)
-    
-    model.to(device)
-    print("GPU is available.")
-    embeds.to(device)
-    print("embeds is available.")
-    
-    print("Test dataset prepared, beginning evaluation...")
-    
-    correct = 0
-    total = 0
-    all_probs = []  # Store probabilities for analysis
-    all_labels = []  # Store true labels
-    
-    with torch.no_grad():
-        for batch_data, batch_label in tqdm(testing_iter, desc="Evaluating"):
-            print("Processing batch...")
-
-            # Ensure batch_data is a tensor
-            batch_data = batch_data.to(device).long()
-            batch_label = batch_label.to(device)
-            
-            if batch_data.max().item() >= len(word_to_index):
-                print(f"Error: One or more indices exceed embedding size: {batch_data.max().item()}")
-                continue  # Skip this batch
-
-            input_data = embeds(autograd.Variable(batch_data)).to(device)
-            
-            # Ensure input_data is reshaped correctly
-            input_data = input_data.permute(0, 2, 1).unsqueeze(1)  # [64, 1, 50, embedding_dim]
-
-            # Process the model
-            outputs = model(input_data)
-
-            # Apply softmax to get probabilities
-            probs = F.softmax(outputs, dim=1)  # Convert logits to probabilities
-            all_probs.append(probs.cpu().numpy())  # Store probabilities
-            all_labels.append(batch_label.cpu().numpy())  # Store true labels
-
-            # Update total and correct
-            total += batch_label.size(0)
-            _, predicted = torch.max(probs, 1)
-            correct += (predicted == batch_label).sum().item()
-        
-            #print(f"Batch processed. Correct predictions so far: {correct}/{total}")
-
-    print("Testing completed.")
-            
-    end_time = time.time()  # End timer
-    elapsed_time = end_time - start_time
-    print(f"Testing completed in {elapsed_time:.2f} seconds.")
-
-    accuracy = 100 * correct / total if total > 0 else 0
-    print(f'Test Accuracy: {accuracy:.2f}%')
-    
-    # Save probabilities and labels for further analysis (e.g., Cleanlab)
-    all_probs = np.concatenate(all_probs, axis=0)
-    all_labels = np.concatenate(all_labels, axis=0)
-    
-    np.save('test_stats/test_probs.npy', all_probs)  # Save probabilities to a file
-    np.save('test_stats/test_labels.npy', all_labels)  # Save true labels to a file
-
-    print("Testing completed.")
+    # Generate and save all the plots with hyperparameters displayed.
+    plot_loss_graph(train_losses, val_losses, test_loss, hyperparams, graph_dir)
+    plot_accuracy_graph(train_accuracies, val_accuracies, test_accuracy, hyperparams, graph_dir)
+    plot_confusion_matrix(test_cm, hyperparams, graph_dir)
+    plot_roc_curve(test_labels, test_probs, hyperparams, graph_dir)
+    plot_precision_recall_curve(test_labels, test_probs, hyperparams, graph_dir)
+    plot_class_distribution(label_counter, hyperparams, graph_dir)
 
 def create_word_to_index(path):
     """
-    Create a word-to-index mapping from the dataset.
-    Args:
-        path (str): Path to the dataset directory.
-    Returns:
-        dict: A dictionary mapping words to indices.
-    """
-    word_to_index = defaultdict(int)
-    UNK_INDEX = 0
-    word_to_index[""] = UNK_INDEX  # Assign UNK index
+    Build a dictionary that maps each unique word in the dataset to a number (index).
 
-    # Read through the data to build the word-to-index mapping
+    Args:
+        path (str): Path to the folder containing the dataset files.
+
+    Returns:
+        dict: A dictionary where keys are words and values are their unique indices.
+    """
+    # Create a dictionary that automatically assigns 0 to new keys (used for unknown words).
+    word_to_index = defaultdict(int)
+    UNK_INDEX = 0  # Index for unknown words (UNK).
+    word_to_index[""] = UNK_INDEX  # Assign the index 0 to the empty string (for unknown words).
+
+    # Loop through each file in the dataset folder.
     for file_name in os.listdir(path):
         file_path = os.path.join(path, file_name)
         with open(file_path, 'r', encoding='utf-8') as file:
+            # Read each line in the file (each line is a JSON object with text data).
             for line in file:
-                current_data = json.loads(line.strip())
-                normalized_text = normalize_text(current_data["text"])
+                current_data = json.loads(line.strip())  # Parse the JSON line into a Python dictionary.
+                normalized_text = normalize_text(current_data["text"])  # Clean and normalize the text.
 
+                # Split the text into words and add each new word to the dictionary.
                 for word in normalized_text.split():
-                    # Add regular words to vocabulary
                     if word not in word_to_index:
-                        word_to_index[word] = len(word_to_index)
-
-                    # Add negated terms (e.g., "NOT_good")
+                        word_to_index[word] = len(word_to_index)  # Assign the next available index.
+                    
+                    # Handle negated words (e.g., "NOT_good") by adding them as separate entries.
                     if word.startswith("NOT_") and word[4:] in word_to_index:
                         if word not in word_to_index:
                             word_to_index[word] = len(word_to_index)
-
-    return dict(word_to_index)
-
+    return dict(word_to_index)  # Convert defaultdict to a regular dictionary and return.
 
 def load_pretrained_embeddings(embedding_path, word_to_index, embedding_dim):
     """
-    Load pre-trained embeddings (e.g., GloVe) and create an embedding matrix.
-    Args:
-        embedding_path (str): Path to the pre-trained embedding file.
-        word_to_index (dict): Mapping of words to indices.
-        embedding_dim (int): Dimension of the embeddings.
-    Returns:
-        torch.FloatTensor: Embedding matrix aligned with word_to_index.
-    """
-    vocab_size = len(word_to_index) + 1  # +1 for padding index
-    embedding_matrix = np.random.uniform(-0.25, 0.25, (vocab_size, embedding_dim))  # Random initialization
+    Load pre-trained GloVe word embeddings and create a matrix for our vocabulary.
 
+    Args:
+        embedding_path (str): Path to the GloVe embeddings file.
+        word_to_index (dict): Dictionary mapping words to their indices.
+        embedding_dim (int): The size of each word embedding (e.g., 300 for GloVe 300d).
+
+    Returns:
+        torch.FloatTensor: A matrix where each row is the embedding vector for a word.
+    """
+    # Calculate the size of our vocabulary (number of unique words + 1 for padding).
+    vocab_size = len(word_to_index) + 1
+    # Create a matrix with random values for all words, which we'll overwrite with GloVe embeddings.
+    embedding_matrix = np.random.uniform(-0.25, 0.25, (vocab_size, embedding_dim))
     print(f"Loading pre-trained embeddings from {embedding_path}...")
+    
+    # Open the GloVe file and read each line.
     with open(embedding_path, 'r', encoding='utf-8') as f:
         for line in f:
-            values = line.split()
-            word = values[0]
-            vector = np.asarray(values[1:], dtype='float32')
+            values = line.split()  # Split the line into the word and its embedding vector.
+            word = values[0]  # The first value is the word.
+            vector = np.asarray(values[1:], dtype='float32')  # The rest are the embedding values.
 
+            # Check if the embedding size matches what we expect.
             if len(vector) != embedding_dim:
                 raise ValueError(f"Embedding dimension mismatch: Expected {embedding_dim}, got {len(vector)}")
-
+            
+            # If the word is in our vocabulary, add its GloVe embedding to the matrix.
             if word in word_to_index:
                 index = word_to_index[word]
                 embedding_matrix[index] = vector
-
-            # Handle negated terms (e.g., "NOT_good")
+            
+            # Handle negated words (e.g., "NOT_good") by negating the original word's embedding.
             if f"NOT_{word}" in word_to_index:
                 index_negated = word_to_index[f"NOT_{word}"]
-                embedding_matrix[index_negated] = -vector  # Negate the vector for contrast
-
+                embedding_matrix[index_negated] = -vector  # Negate the vector to represent the opposite meaning.
+    
     print("Pre-trained embeddings loaded successfully.")
-    return torch.FloatTensor(embedding_matrix)
-
-
-
+    return torch.FloatTensor(embedding_matrix)  # Convert the matrix to a PyTorch tensor and return.
 
 def normalize_text(text):
     """
-    Normalize text by converting to lowercase, removing punctuation,
-    and handling negations.
-    """
-    text = text.lower() #convert lowercase
-    
-    # Replace Unicode quotation marks with ASCII equivalents
-    text = text.replace("\u2018", "'").replace("\u2019", "'")  # Single quotes
-    text = text.replace("\u201c", '"').replace("\u201d", '"')  # Double quotes
+    Clean and normalize text by converting it to lowercase, removing punctuation, and handling negations.
 
-    # Remove other Unicode characters (optional)
-    text = re.sub(r'[^\x00-\x7F]+', '', text)  # Remove non-ASCII characters
+    Args:
+        text (str): The input text to normalize.
+
+    Returns:
+        str: The cleaned and normalized text.
+    """
+    text = text.lower()  # Convert all characters to lowercase for consistency.
     
-    text = re.sub(r'[^\w\s]', '', text)  # Remove punctuation
-    negation_words = {"not", "no", "never", "none", "don't", "doesn't"}
+    # Replace special Unicode quotation marks with standard ASCII quotes.
+    text = text.replace("\u2018", "'").replace("\u2019", "'")  # Single quotes.
+    text = text.replace("\u201c", '"').replace("\u201d", '"')  # Double quotes.
+
+    # Remove any non-ASCII characters (e.g., emojis, special symbols).
+    text = re.sub(r'[^\x00-\x7F]+', '', text)
     
+    # Remove punctuation, keeping only letters, numbers, and spaces.
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    # Define a set of negation words that indicate the next word should be negated.
+    negation_words = {"not", "no", "never", "none", "don't", "doesn't", "isn't", "won't", "didn't"}
+    
+    # Split the text into words and process each word.
     words = text.split()
     new_words = []
-    negate_next = False
+    negate_next = False  # Flag to track if the next word should be negated.
 
     for word in words:
         if negate_next:
-            new_words.append("NOT_" + word)  # Prefix negated words
-            negate_next = False
+            new_words.append("NOT_" + word)  # Add "NOT_" prefix to the word to indicate negation.
+            negate_next = False  # Reset the flag.
         elif word in negation_words:
-            negate_next = True
+            negate_next = True  # Set the flag to negate the next word.
         else:
-            new_words.append(word)
-
-    return ' '.join(new_words)
-
+            new_words.append(word)  # Keep the word as is.
+    
+    return ' '.join(new_words)  # Join the words back into a single string and return.
 
 def load_word_to_index(file_path):
+    """
+    Load the word-to-index mapping from a JSON file if it exists.
+
+    Args:
+        file_path (str): Path to the JSON file with the mapping.
+
+    Returns:
+        dict: The word-to-index mapping, or an empty dictionary if the file doesn't exist.
+    """
     if os.path.exists(file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+            return json.load(f)  # Load and return the mapping.
+    return {}  # Return an empty dictionary if the file doesn't exist.
 
 def update_word_to_index(new_words, existing_mapping):
     """
-    Update an existing word-to-index mapping with new words.
+    Add new words to an existing word-to-index mapping.
+
     Args:
-        new_words (iterable): A list of new words to add.
-        existing_mapping (dict): The existing word-to-index mapping.
+        new_words (iterable): List of new words to add.
+        existing_mapping (dict): The current word-to-index mapping.
+
     Returns:
         dict: The updated word-to-index mapping.
     """
     for word in new_words:
-        # Add regular words
+        # Add the word if it's not already in the mapping.
         if word not in existing_mapping:
-            existing_mapping[word] = len(existing_mapping)
-
-        # Add negated terms (e.g., "NOT_good")
+            existing_mapping[word] = len(existing_mapping)  # Assign the next available index.
+        
+        # Handle negated words (e.g., "NOT_good") by adding them as separate entries.
         if word.startswith("NOT_") and word[4:] in existing_mapping:
             if word not in existing_mapping:
                 existing_mapping[word] = len(existing_mapping)
-
+    
     return existing_mapping
 
+def plot_loss_graph(train_losses, val_losses, test_loss, hyperparams, graph_dir, filename='loss_graph.png'):
+    """
+    Create a plot comparing training, validation, and test loss over epochs, with hyperparameters displayed.
 
-def plot_loss_graph(losses, graph_dir, filename='trainging_loss_graph.png'):
-    plt.figure(figsize=(10, 5))
-    plt.plot(losses, color='blue', label='Loss')
-    plt.title('Training Loss Over Iterations')
-    plt.xlabel('Iteration (per 100 batches)')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(graph_dir, filename))  # Save the graph as an image
-    plt.close()  # Close the figure to free memory
-
-# Validation function with detailed metrics logging
-def validate_model(loader, model, criterion, device, embeds):
-    model.eval()
+    Args:
+        train_losses (list): List of training losses for each epoch.
+        val_losses (list): List of validation losses for each epoch.
+        test_loss (float): The final test loss.
+        hyperparams (dict): Dictionary of hyperparameters to display on the plot.
+        graph_dir (str): Folder to save the plot.
+        filename (str): Name of the file to save the plot as.
+    """
+    epochs = range(1, len(train_losses) + 1)  # Create a range of epoch numbers (1 to number of epochs).
+    plt.figure(figsize=(10, 6)) 
+    plt.plot(epochs, train_losses, label='Training Loss', color='blue')  # Plot training loss in blue.
+    plt.plot(epochs, val_losses, label='Validation Loss', color='orange')  # Plot validation loss in orange.
+    plt.axhline(y=test_loss, color='red', linestyle='--', label='Test Loss')  # Add a horizontal line for test loss in red.
+    best_epoch = val_losses.index(min(val_losses)) + 1  # Find the epoch with the lowest validation loss.
+    plt.axvline(x=best_epoch, color='green', linestyle=':', label='Best Model Epoch')  # Mark the best epoch with a green line.
+    plt.title('Training, Validation, and Test Loss Comparison')  
+    plt.xlabel('Epoch') 
+    plt.ylabel('Loss') 
+    plt.legend()  
+    plt.grid(True) 
     
-    total_loss = 0.0
-    all_preds = []
-    all_labels = []
+    # Create a text box with the hyperparameters and add it to the top-left corner of the plot.
+    hyperparam_text = '\n'.join([f"{key}: {value}" for key, value in hyperparams.items()])
+    plt.text(0.98, 0.98, hyperparam_text, transform=plt.gca().transAxes, fontsize=10,
+             verticalalignment='top', horizontalalignment='right', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.savefig(os.path.join(graph_dir, filename))  # Save the plot.
+    plt.close()  
 
-    with torch.no_grad():
+def plot_accuracy_graph(train_accuracies, val_accuracies, test_accuracy, hyperparams, graph_dir, filename='accuracy_graph.png'):
+    """
+    Create a plot comparing training, validation, and test accuracy over epochs, with hyperparameters displayed.
+
+    Args:
+        train_accuracies (list): List of training accuracies for each epoch.
+        val_accuracies (list): List of validation accuracies for each epoch.
+        test_accuracy (float): The final test accuracy.
+        hyperparams (dict): Dictionary of hyperparameters to display on the plot.
+        graph_dir (str): Folder to save the plot.
+        filename (str): Name of the file to save the plot as.
+    """
+    epochs = range(1, len(train_accuracies) + 1)  # Create a range of epoch numbers.
+    plt.figure(figsize=(10, 6))  
+    plt.plot(epochs, train_accuracies, label='Training Accuracy', color='blue')  # Plot training accuracy in blue.
+    plt.plot(epochs, val_accuracies, label='Validation Accuracy', color='orange')  # Plot validation accuracy in orange.
+    plt.axhline(y=test_accuracy, color='red', linestyle='--', label='Test Accuracy')  # Add a line for test accuracy in red.
+    best_epoch = val_accuracies.index(max(val_accuracies)) + 1  # Find the epoch with the highest validation accuracy.
+    plt.axvline(x=best_epoch, color='green', linestyle=':', label='Best Model Epoch')  # Mark the best epoch with a green line.
+    plt.title('Training, Validation, and Test Accuracy Comparison')  
+    plt.xlabel('Epoch') 
+    plt.ylabel('Accuracy (%)')  
+    plt.legend() 
+    plt.grid(True) 
+    
+    # Add a text box with the hyperparameters in the top-left corner.
+    hyperparam_text = '\n'.join([f"{key}: {value}" for key, value in hyperparams.items()])
+    plt.text(0.02, 0.98, hyperparam_text, transform=plt.gca().transAxes, fontsize=10,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.savefig(os.path.join(graph_dir, filename))  # Save the plot.
+    plt.close()  
+
+def plot_confusion_matrix(cm, hyperparams, graph_dir, filename='confusion_matrix.png'):
+    """
+    Create a heatmap showing the confusion matrix, with hyperparameters displayed.
+
+    Args:
+        cm (array): The confusion matrix (true vs. predicted labels).
+        hyperparams (dict): Dictionary of hyperparameters to display on the plot.
+        graph_dir (str): Folder to save the plot.
+        filename (str): Name of the file to save the plot as.
+    """
+    plt.figure(figsize=(8, 6))  
+    # Create a heatmap of the confusion matrix, with numbers shown in each cell.
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Negative', 'Positive'],
+                yticklabels=['Negative', 'Positive'])
+    plt.title('Confusion Matrix')  
+    plt.ylabel('True Label')  
+    plt.xlabel('Predicted Label')  
+    
+    # Add a text box with the hyperparameters on the right side to avoid overlapping with the heatmap.
+    hyperparam_text = '\n'.join([f"{key}: {value}" for key, value in hyperparams.items()])
+    plt.text(0.7, 0.98, hyperparam_text, transform=plt.gca().transAxes, fontsize=10,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.savefig(os.path.join(graph_dir, filename), bbox_inches='tight')  # Save the plot, ensuring the text box fits.
+    plt.close()  
+
+def plot_roc_curve(labels, probs, hyperparams, graph_dir, filename='roc_curve.png'):
+    """
+    Create a Receiver Operating Characteristic (ROC) curve to show how well the model distinguishes classes, with hyperparameters displayed.
+
+    Args:
+        labels (list): True labels from the test set.
+        probs (list): Predicted probabilities for the positive class.
+        hyperparams (dict): Dictionary of hyperparameters to display on the plot.
+        graph_dir (str): Folder to save the plot.
+        filename (str): Name of the file to save the plot as.
+    """
+    # Calculate the false positive rate (FPR) and true positive rate (TPR) for the ROC curve.
+    fpr, tpr, _ = roc_curve(labels, probs)
+    roc_auc = auc(fpr, tpr)  # Calculate the Area Under the Curve (AUC).
+    plt.figure(figsize=(8, 6))  
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')  # Plot the ROC curve.
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')  # Add a diagonal line (random guessing baseline).
+    plt.xlim([0.0, 1.0])  # Set x-axis limits.
+    plt.ylim([0.0, 1.05])  # Set y-axis limits.
+    plt.xlabel('False Positive Rate')  
+    plt.ylabel('True Positive Rate') 
+    plt.title('Receiver Operating Characteristic (ROC) Curve') 
+    plt.legend(loc="lower right")  
+    plt.grid(True)  
+    
+    # Add a text box with the hyperparameters in the top-left corner.
+    hyperparam_text = '\n'.join([f"{key}: {value}" for key, value in hyperparams.items()])
+    plt.text(0.02, 0.98, hyperparam_text, transform=plt.gca().transAxes, fontsize=10,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.savefig(os.path.join(graph_dir, filename))  # Save the plot.
+    plt.close() 
+
+def plot_precision_recall_curve(labels, probs, hyperparams, graph_dir, filename='precision_recall_curve.png'):
+    """
+    Create a Precision-Recall curve to show the trade-off between precision and recall, with hyperparameters displayed.
+
+    Args:
+        labels (list): True labels from the test set.
+        probs (list): Predicted probabilities for the positive class.
+        hyperparams (dict): Dictionary of hyperparameters to display on the plot.
+        graph_dir (str): Folder to save the plot.
+        filename (str): Name of the file to save the plot as.
+    """
+    # Calculate precision and recall values for the curve.
+    precision, recall, _ = precision_recall_curve(labels, probs)
+    plt.figure(figsize=(8, 6))  
+    plt.plot(recall, precision, color='purple', lw=2, label='Precision-Recall curve')  # Plot the curve.
+    plt.xlabel('Recall') 
+    plt.ylabel('Precision') 
+    plt.title('Precision-Recall Curve')  
+    plt.legend(loc="lower left")  
+    plt.grid(True) 
+    
+    # Add a text box with the hyperparameters in the top-left corner.
+    hyperparam_text = '\n'.join([f"{key}: {value}" for key, value in hyperparams.items()])
+    plt.text(0.98, 0.98, hyperparam_text, transform=plt.gca().transAxes, fontsize=10,
+             verticalalignment='top',horizontalalignment='right', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.savefig(os.path.join(graph_dir, filename))  # Save the plot.
+    plt.close() 
+
+def plot_class_distribution(label_counter, hyperparams, graph_dir, filename='class_distribution.png'):
+    """
+    Create a bar chart showing the distribution of classes in the test set, with hyperparameters displayed.
+
+    Args:
+        label_counter (Counter): Counts of each class in the test set.
+        hyperparams (dict): Dictionary of hyperparameters to display on the plot.
+        graph_dir (str): Folder to save the plot.
+        filename (str): Name of the file to save the plot as.
+    """
+    labels = ['Negative', 'Positive']  # Names of the classes.
+    counts = [label_counter[0], label_counter[1]]  # Counts for each class.
+    plt.figure(figsize=(8, 6))
+    plt.bar(labels, counts, color=['blue', 'orange'])  # Create a bar chart with blue and orange bars.
+    plt.title('Class Distribution in Test Set')
+    plt.xlabel('Class')
+    plt.ylabel('Number of Samples') 
+    plt.grid(True, axis='y')
+    
+    # Add a text box with the hyperparameters in the top-left corner.
+    hyperparam_text = '\n'.join([f"{key}: {value}" for key, value in hyperparams.items()])
+    plt.text(0.02, 0.02, hyperparam_text, transform=plt.gca().transAxes, fontsize=10,
+             verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.savefig(os.path.join(graph_dir, filename))  # Save the plot.
+    plt.close()
+
+def evaluate_model(loader, model, criterion, device, embeds, return_probs=False):
+    """
+    Evaluate the model on a dataset (e.g., validation or test set) and return metrics like loss and accuracy.
+
+    Args:
+        loader (DataLoader): The data loader for the dataset to evaluate.
+        model: The DPCNN model to evaluate.
+        criterion: The loss function to calculate the loss.
+        device: The device (CPU or GPU) to run the model on.
+        embeds: The embedding layer to convert word indices to embeddings.
+        return_probs (bool): If True, return the predicted probabilities for the positive class.
+
+    Returns:
+        tuple: Average loss, accuracy, predictions, true labels, confusion matrix, and optionally probabilities.
+    """
+    model.eval()  # Set the model to evaluation mode (disables dropout, batch norm updates, etc.).
+    total_loss = 0.0  # Total loss for the dataset.
+    all_preds = []  # List to store all predictions.
+    all_labels = []  # List to store all true labels.
+    all_probs = []  # List to store predicted probabilities (if requested).
+    
+    with torch.no_grad():  # Disable gradient computation for evaluation (saves memory and speeds up).
         for batch_data, batch_labels in loader:
+            # Move the batch data and labels to the chosen device.
             batch_data, batch_labels = batch_data.to(device), batch_labels.to(device)
             
+            # Convert word indices to embeddings and reshape for the DPCNN model.
             input_data = embeds(batch_data).float().permute(0, 2, 1).unsqueeze(1)
-            outputs = model(input_data)
+            outputs = model(input_data)  # Get the model's predictions.
+            loss = criterion(outputs, batch_labels)  # Calculate the loss.
+            total_loss += loss.item()  # Add the loss for this batch.
+            _, preds = torch.max(outputs, dim=1)  # Get the predicted class (highest score).
             
-            loss = criterion(outputs, batch_labels)
-            total_loss += loss.item()
-
-            _, preds = torch.max(outputs, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch_labels.cpu().numpy())
-
+            # Calculate the probability of the positive class for ROC and precision-recall curves.
+            probs = torch.softmax(outputs, dim=1)[:, 1]
+            all_preds.extend(preds.cpu().numpy())  # Store predictions.
+            all_labels.extend(batch_labels.cpu().numpy())  # Store true labels.
+            all_probs.extend(probs.cpu().numpy())  # Store probabilities.
+    
+    # Calculate the average loss and accuracy for the dataset.
     avg_loss = total_loss / len(loader)
+    accuracy = (np.array(all_preds) == np.array(all_labels)).mean() * 100
+    cm = confusion_matrix(all_labels, all_preds)  # Create the confusion matrix.
     
-    report = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
-    
-    print(f"Validation Metrics:\n"
-          f"Precision: {report['weighted avg']['precision']:.4f}, "
-          f"Recall: {report['weighted avg']['recall']:.4f}, "
-          f"F1-Score: {report['weighted avg']['f1-score']:.4f}")
-    
-    accuracy = report['accuracy'] * 100
-    
-    return avg_loss, accuracy
+    if return_probs:
+        return avg_loss, accuracy, all_preds, all_labels, cm, all_probs
+    return avg_loss, accuracy, all_preds, all_labels, cm
 
 if __name__ == '__main__':
-    # Train & Test the model
-    train_model(config)
-    
+    # Start the training and evaluation process.
+    train_model(config, train_data_path, val_data_path, test_data_path, device, checkpoint_dir, graph_dir)

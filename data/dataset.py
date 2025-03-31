@@ -30,35 +30,24 @@ class TextDataset(data.Dataset):
             with open(file_path, 'r', encoding='utf-8') as file:
                 for line in file:
                     item = json.loads(line.strip())
-                    text = item["text"]
+                    text = self.normalize_text(item["text"])
                     label = item['label']
-                    
-                    # Normalize text
-                    text = self.normalize_text(text)
 
                     # Apply augmentation if enabled
                     if self.augment:
                         text = self.apply_augmentation(text)
 
-                    # Tokenize and convert to indices
-                    tokens = text.split()
-                    indices = [self.word_to_index.get(word, 0) for word in tokens]
-                    
-                    # Skip empty texts
-                    if not indices:  # Check if the list is empty
+                    indices = [self.word_to_index.get(word, 1) for word in text.split()]  # 1 for UNK, 0 for padding
+                    if not indices:
                         continue
                     
-                    # Pad or truncate to match sentence_max_size
                     if len(indices) < self.max_length:
-                        indices += [0] * (self.max_length - len(indices))  # Pad with zeros
+                        indices += [0] * (self.max_length - len(indices))
                     else:
-                        indices = indices[:self.max_length]  # Truncate if too long
-                        
+                        indices = indices[:self.max_length]
                     
                     self.data_set.append(indices)
                     self.labels.append(label)
-
-        print(f"Number of labels loaded: {len(self.labels)}")
 
     def normalize_text(self, text):
         """Normalize text by converting to lowercase and removing punctuation."""
@@ -130,17 +119,17 @@ class TextDataset(data.Dataset):
         
 
     def __getitem__(self, index):
-        """
-        Return tokenized and padded/truncated sequences.
-        Args:
-            index (int): Index of the sample.
-        Returns:
-            tensor_indices (torch.Tensor): Tokenized and padded sequence.
-            label (int): Corresponding label (0 or 1).
-        """
-        tensor_indices = torch.tensor(self.data_set[index], dtype=torch.long)
-        label = torch.tensor(self.labels[index], dtype=torch.long)
-        return tensor_indices, label
+        text = ' '.join([k for k, v in self.word_to_index.items() if v in self.data_set[index]])
+        if self.augment and random.random() < 0.5:  # Apply augmentation dynamically
+            text = self.apply_augmentation(text)
+            indices = [self.word_to_index.get(word, 1) for word in text.split()]
+            if len(indices) < self.max_length:
+                indices += [0] * (self.max_length - len(indices))
+            else:
+                indices = indices[:self.max_length]
+        else:
+            indices = self.data_set[index]
+        return torch.tensor(indices, dtype=torch.long), torch.tensor(self.labels[index], dtype=torch.long)
 
     def __len__(self):
         return len(self.data_set)

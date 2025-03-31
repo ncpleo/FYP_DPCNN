@@ -1,10 +1,5 @@
 # Deep Pyramid Convolutional Neural Networks for Text Categorization
 
-> This is a simple version of the paper *Deep Pyramid Convolutional Neural Networks for Text Categorization*.
-
-
-!['model'](./pictures/figure1.png)
-
 Please download the GloVe "glove.6B.zip" first, from https://nlp.stanford.edu/projects/glove/, then extract and place "glove.6B.300d.txt" into /data/glove/
 
 run by

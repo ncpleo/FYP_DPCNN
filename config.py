@@ -13,7 +13,7 @@ class Config(object):
                  dict_size=50000,
                  bidirectional=False,
                  doc_len=40,
-                 label_num=2
+                 label_num=3
                  ):
         self.word_embedding_dimension = word_embedding_dimension
         self.word_num = word_num
